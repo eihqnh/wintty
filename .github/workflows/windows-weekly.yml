@@ -1,0 +1,78 @@
+# Weekly Windows build of the fork. Nothing scheduled built Windows before
+# this, so a break that only appears over time (a NuGet floor moving, a
+# Windows App SDK patch release, a runner image roll) went unnoticed until
+# someone next ran a build by hand.
+#
+# Plain build + package: the Release DLL, the Release shell, and the
+# NativeAOT publish that users actually run, zipped and kept as a workflow
+# artifact. It is not a release - nothing is signed, nothing is uploaded
+# anywhere a user could install it from, and it expires after 30 days.
+
+name: windows-weekly
+
+on:
+  schedule:
+    # Mondays 05:17 UTC. Off the hour: :00 is the busiest minute on
+    # GitHub's schedule queue, and a delayed run distorts "weekly".
+    - cron: '17 5 * * 1'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-win:
+    # Gate on this repo, so a fork of this fork does not burn its own runner
+    # every Monday. Every run here spends eihqnh/wintty's own Actions quota;
+    # the upstream ghostty-org/ghostty copy is a separate file with its own
+    # quota, so nothing done here touches upstream's runners.
+    if: github.repository == 'eihqnh/wintty'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # No version input: reads .minimum_zig_version from build.zig.zon.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      # No version input: installs the SDK pinned by the root global.json.
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+
+      # Release DLL, baseline ISA, as `just build-dll-release`. The shell
+      # hard-errors without zig-out/lib/ghostty.dll, so this comes first.
+      - name: Build ghostty.dll
+        run: zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline
+
+      # The shell, as `just build-win-release`.
+      - name: Build solution
+        run: dotnet build windows/Ghostty.sln /p:Platform=x64 /p:Configuration=Release /p:RestoreLockedMode=true
+
+      # NativeAOT publish: the shape users run. --no-restore because the
+      # solution build above already restored under the lock.
+      - name: Publish
+        run: |
+          dotnet publish windows/Ghostty/Ghostty.csproj `
+            -c Release -r win-x64 /p:Platform=x64 --no-restore
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package
+        run: |
+          $exe = @(Get-ChildItem -Path windows/Ghostty/bin -Recurse -Filter Wintty.exe |
+            Where-Object { $_.FullName -match '\\publish\\' } |
+            Sort-Object LastWriteTime -Descending)
+          if ($exe.Count -eq 0) { Write-Error 'publish exe not found'; exit 1 }
+          "wintty $(git rev-parse --short HEAD), weekly build, $(Get-Date -Format u) UTC" |
+            Set-Content -Path (Join-Path $exe[0].DirectoryName 'BUILD-INFO.txt')
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'wintty-win-x64.zip'
+          Compress-Archive -Path (Join-Path $exe[0].DirectoryName '*') -DestinationPath $zip
+          "packaged $((Get-Item $zip).Length) bytes"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wintty-win-x64-${{ github.sha }}
+          path: wintty-win-x64.zip
+          retention-days: 30
